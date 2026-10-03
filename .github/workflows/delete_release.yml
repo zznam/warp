@@ -25,7 +25,7 @@ on:
 jobs:
   delete_release:
     name: Delete Release Branch
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LOCAL_RUNNER_LABELS || '["ubuntu-latest"]') }}
     steps:
       - name: Verify confirmation
         run: |

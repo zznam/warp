@@ -17,7 +17,7 @@ on:
 
 jobs:
   close-fix-prs:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LOCAL_RUNNER_LABELS || '["ubuntu-latest"]') }}
     if: contains(github.event.pull_request.labels.*.name, 'auto-fix-ci') && github.repository_owner == 'warpdotdev'
     steps:
       - name: Close Dependent Fix PRs

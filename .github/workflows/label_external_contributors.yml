@@ -27,7 +27,7 @@ permissions:
 jobs:
   label-external-contributor:
     name: Label external-contributor PRs
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LOCAL_RUNNER_LABELS || '["ubuntu-latest"]') }}
     if: github.repository_owner == 'warpdotdev'
     permissions:
       pull-requests: write

@@ -66,7 +66,7 @@ jobs:
   # assets and upload them as appropriate.
   prepare_release:
     name: Prepare release
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LOCAL_RUNNER_LABELS || '["ubuntu-latest"]') }}
     outputs:
       release_branch: ${{ steps.create_branch_and_tag.outputs.branch }}
       release_tag: ${{ steps.create_branch_and_tag.outputs.tag }}
@@ -2782,7 +2782,7 @@ jobs:
   # depends on did not succeed.
   collect_results:
     name: Collect release job results
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LOCAL_RUNNER_LABELS || '["ubuntu-latest"]') }}
     needs:
       - prepare_release
       - release_macos_single_arch
@@ -2879,7 +2879,7 @@ jobs:
 
   send_slack_notif_if_unsuccessful:
     name: Send Slack notification if any release jobs were unsuccessful
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LOCAL_RUNNER_LABELS || '["ubuntu-latest"]') }}
     needs:
       - prepare_release
       - collect_results
@@ -2902,7 +2902,7 @@ jobs:
   generate_changelogs:
     name: Generate Changelogs
     if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LOCAL_RUNNER_LABELS || '["ubuntu-latest"]') }}
     needs:
       - prepare_release
       - collect_results
