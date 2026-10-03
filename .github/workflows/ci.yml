@@ -42,7 +42,7 @@ jobs:
   params:
     name: Compute workflow parameters
     timeout-minutes: 3
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LOCAL_RUNNER_LABELS || '["ubuntu-latest"]') }}
     # Don't automatically run CI for draft PRs, to reduce GitHub Actions costs.
     #
     # Also, don't run CI for repo-sync PRs _unless_ there is a merge conflict - for those,
@@ -544,7 +544,7 @@ jobs:
   database-migration:
     name: Database Migration (Diesel)
     timeout-minutes: 5
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LOCAL_RUNNER_LABELS || '["ubuntu-latest"]') }}
     needs: params
     if: ${{ needs.params.outputs.affects-database-schema == 'true' }}
     steps:
@@ -648,7 +648,7 @@ jobs:
     timeout-minutes: 10
     strategy:
       fail-fast: false
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LOCAL_RUNNER_LABELS || '["ubuntu-latest"]') }}
     needs: params
     if: ${{ needs.params.outputs.needs-build == 'true' }}
     steps:

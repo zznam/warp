@@ -12,7 +12,7 @@ on:
 jobs:
   compute_channel:
     name: Compute release channel
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LOCAL_RUNNER_LABELS || '["ubuntu-latest"]') }}
     outputs:
       channel: ${{ steps.compute-channel.outputs.channel }}
     steps:
@@ -43,7 +43,7 @@ jobs:
     name: Update channel_versions.json
     needs:
       - create_release_candidate
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LOCAL_RUNNER_LABELS || '["ubuntu-latest"]') }}
     steps:
       - name: Invoke update workflow in channel-versions repository
         uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
