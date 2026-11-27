@@ -114,12 +114,14 @@ async fn run_async(args: &EnvironmentCheckoutArgs) -> anyhow::Result<()> {
         .map_err(|error| sanitized_error("could not read environment checkout requests", error))?;
     let mut batch = CheckoutBatch::parse(&bytes)
         .map_err(|error| sanitized_error("could not parse environment checkout requests", error))?;
-    super::environment_preparation::resolve_from_environment(
-        &mut batch,
-        args.fail_if_target_exists,
-        args.remove_origins_only,
-    )
-    .map_err(|error| sanitized_error("execution repository preparation rejected", error))?;
+    if !args.legacy_preparation {
+        super::environment_preparation::resolve_from_environment(
+            &mut batch,
+            args.fail_if_target_exists,
+            args.remove_origins_only,
+        )
+        .map_err(|error| sanitized_error("execution repository preparation rejected", error))?;
+    }
     let mirror_root = (!args.remove_origins_only)
         .then(optional_mirror_root)
         .flatten();
@@ -136,7 +138,7 @@ async fn run_async(args: &EnvironmentCheckoutArgs) -> anyhow::Result<()> {
     } else {
         None
     };
-    if !failed && !args.remove_origins_only {
+    if !args.remove_origins_only {
         resolve_heads(&batch, &mut outcomes).await;
     }
     let bytes = serde_json::to_vec(&CheckoutReport {
@@ -170,6 +172,7 @@ async fn resolve_heads(batch: &CheckoutBatch, outcomes: &mut [CheckoutOutcome]) 
     let mut capture = stream::iter(
         outcomes
             .iter_mut()
+            .filter(|outcome| outcome.failure.is_none())
             .filter(|outcome| outcome.resolved_head.is_none())
             .filter_map(|outcome| {
                 batch
@@ -713,7 +716,18 @@ async fn checkout(
             git.record_error("could not create checkout target", error);
             CheckoutFailureKind::Clone
         })?;
-        checkout_direct(request, &url, &target, git).await
+        let result = checkout_direct(request, &url, &target, git).await;
+        if result == Err(CheckoutFailureKind::Clone) {
+            // A failed blob transfer can leave HEAD but no working tree. This target was created
+            // by this attempt, so remove it before a retry can mistake it for an existing checkout.
+            if let Err(error) = fs::remove_dir_all(&target).await
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                git.record_error("could not remove failed clone target", error);
+                return Err(CheckoutFailureKind::RemoveTarget);
+            }
+        }
+        result
     }
     .await;
     tracing::Span::current().record("existing", existing_field);
@@ -757,7 +771,7 @@ async fn attempt_cached_checkout(
         }
         fs::remove_dir_all(target).await.map_err(|error| {
             git.record_error("could not remove failed cached checkout target", error);
-            CheckoutFailureKind::Clone
+            CheckoutFailureKind::RemoveTarget
         })?;
         Ok(CachedCheckout::Failed)
     }
@@ -1090,9 +1104,8 @@ async fn checkout_direct(
     let result = async {
         // Branch-only and pinned-commit requests start from an empty repository because a clone would
         // also download the default branch's history, which they do not want.
-        if request.fetch_branch_only
-            || matches!(request.head, Some(RepositoryHeadRef::CommitSha(_)))
-        {
+        let pinned = matches!(request.head, Some(RepositoryHeadRef::CommitSha(_)));
+        if request.fetch_branch_only || pinned {
             git.run("checkout initialization", target, &["init", "--quiet"])
                 .await
                 .map_err(|_| CheckoutFailureKind::Clone)?;
@@ -1106,7 +1119,19 @@ async fn checkout_direct(
         } else {
             clone_repository(request, url, target, git).await?;
         }
-        checkout_requested_head(request, target, git).await
+        let result = checkout_requested_head(request, target, git).await;
+        // A pinned commit's fetch is the first time the remote is contacted, so a failure only
+        // means the commit is missing if the remote answers.
+        if pinned
+            && result == Err(CheckoutFailureKind::Checkout)
+            && git
+                .run("remote probe", target, &["ls-remote", "origin", "HEAD"])
+                .await
+                .is_err()
+        {
+            return Err(CheckoutFailureKind::Clone);
+        }
+        result
     }
     .await;
     tracing::Span::current().record("result_ok", result.is_ok());
@@ -1194,18 +1219,24 @@ async fn clone_from_mirror(
         .map_err(|_| clone_error)?;
         let result = match head {
             Some(RepositoryHeadRef::Branch(branch)) => {
-                git.run(
-                    "requested head checkout",
-                    target,
-                    &[
-                        "-c",
-                        "checkout.workers=0",
-                        "checkout",
-                        "--detach",
-                        &format!("refs/remotes/origin/{branch}"),
-                    ],
-                )
-                .await
+                let branch_ref = format!("refs/remotes/origin/{branch}");
+                match git
+                    .run(
+                        "requested head checkout",
+                        target,
+                        &[
+                            "-c",
+                            "checkout.workers=0",
+                            "checkout",
+                            "--detach",
+                            &branch_ref,
+                        ],
+                    )
+                    .await
+                {
+                    Ok(output) => Ok(output),
+                    Err(()) => checkout_tag_without_branch(branch, &branch_ref, target, git).await,
+                }
             }
             Some(RepositoryHeadRef::CommitSha(sha)) => {
                 // No branch or tag necessarily reaches a pinned commit, so the mirror may lack it.
@@ -1239,6 +1270,34 @@ async fn clone_from_mirror(
     .await;
     tracing::Span::current().record("result_ok", result.is_ok());
     result
+}
+
+/// Checks out the tag `name` in a clone of the mirror after its branch checkout failed. Tags ride
+/// branch heads, so a name with no branch falls back to the tag of that name; a branch that
+/// exists keeps its checkout failure, so the branch wins when both exist.
+async fn checkout_tag_without_branch(
+    name: &str,
+    branch_ref: &str,
+    target: &Path,
+    git: &mut Git,
+) -> Result<String, ()> {
+    let tag_ref = format!("refs/tags/{name}");
+    let refs = git
+        .run(
+            "requested tag lookup",
+            target,
+            &["for-each-ref", "--format=%(refname)", branch_ref, &tag_ref],
+        )
+        .await?;
+    if refs.lines().any(|line| line == branch_ref) || !refs.lines().any(|line| line == tag_ref) {
+        return Err(());
+    }
+    git.run(
+        "requested tag checkout",
+        target,
+        &["-c", "checkout.workers=0", "checkout", "--detach", &tag_ref],
+    )
+    .await
 }
 
 /// Builds the checkout for a branch-only request by fetching just that branch from the remote
@@ -1387,8 +1446,9 @@ async fn clone_repository(
 /// A branch-only request fetches just the requested branch and stores it under the default
 /// branch's tracking ref, so the repository holds a single remote-tracking branch that
 /// `origin/HEAD` resolves to. Any other head is fetched by name, which also reaches commits that
-/// no branch points to. Fetches are blobless so file contents are downloaded only for what gets
-/// checked out.
+/// no branch points to, except that a branch head is first fetched as `refs/heads/<name>`, because
+/// fetching a bare name prefers a tag of the same name. Fetches are blobless so file contents are
+/// downloaded only for what gets checked out.
 #[tracing::instrument(skip_all, fields(
     tags.cloud_agent = true,
     head_kind = head_kind(request.head.as_ref()),
@@ -1447,13 +1507,31 @@ async fn checkout_requested_head(
             .await
             .map_err(|_| checkout_error)?;
         } else {
-            git.run(
-                "requested head fetch",
-                target,
-                &["fetch", "--filter=blob:none", "origin", head.value()],
-            )
-            .await
-            .map_err(|_| checkout_error)?;
+            let fetched_branch = match head {
+                RepositoryHeadRef::Branch(branch) => git
+                    .run(
+                        "requested branch fetch",
+                        target,
+                        &[
+                            "fetch",
+                            "--filter=blob:none",
+                            "origin",
+                            &format!("refs/heads/{branch}"),
+                        ],
+                    )
+                    .await
+                    .is_ok(),
+                RepositoryHeadRef::CommitSha(_) => false,
+            };
+            if !fetched_branch {
+                git.run(
+                    "requested head fetch",
+                    target,
+                    &["fetch", "--filter=blob:none", "origin", head.value()],
+                )
+                .await
+                .map_err(|_| checkout_error)?;
+            }
             git.run(
                 "requested head checkout",
                 target,

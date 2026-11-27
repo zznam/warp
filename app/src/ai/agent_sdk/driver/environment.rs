@@ -45,9 +45,13 @@ use crate::terminal::shell::ShellType;
 
 const CODEBASE_INDEX_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const CLONE_FAILURE_OUTPUT_TRUNCATION_MARKER: &str = "\n… clone output truncated …\n";
+const CLONE_RETRY_DELAY: Duration = Duration::from_secs(3);
 const SETUP_COMMAND_OUTPUT_TRUNCATION_MARKER: &str = "\n… setup command output truncated …\n";
 const SETUP_COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
 const SETUP_COMMAND_CWD_RESET_TIMEOUT: Duration = Duration::from_secs(30);
+const CHECKOUT_HELPER_TIMEOUT: Duration = Duration::from_mins(30);
+/// Skill sources are optional, so a run waits much less for them.
+const SKILL_SOURCE_CHECKOUT_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[derive(Clone, Copy, Debug)]
 pub enum SetupCommandPhase {
@@ -129,6 +133,8 @@ pub enum PrepareEnvironmentError {
     UnsupportedRepositoryForge { repo_name: String },
     #[error("Environment checkout helper failed: {reason}")]
     CheckoutHelper { reason: &'static str },
+    #[error("Environment checkout helper timed out after {timeout_seconds}s")]
+    CheckoutHelperTimedOut { timeout_seconds: u64 },
     #[error("Terminal driver error while preparing environment: {source}")]
     TerminalDriver { source: AgentDriverError },
 }
@@ -246,6 +252,12 @@ pub(crate) struct WorkspaceConfiguration {
     pub setup_commands: Vec<String>,
     /// Overrides `WARP_SKILL_DIRS` when present, including an empty list.
     pub factory_skill_dirs: Option<Vec<PathBuf>>,
+    /// The server-provided Factory definition folders within `factory_skill_dirs`, before
+    /// configured-skill folders are merged in. Only these are scanned for skill reference files.
+    pub definition_skill_dirs: Option<Vec<PathBuf>>,
+    /// The commit a Factory branch run checks its run-scoped definition clone out at. `None` keeps
+    /// the clone on the definition repository's default branch.
+    pub factory_definition_sha: Option<String>,
     /// Retains an explicitly selected environment even when it has no repositories or commands.
     pub has_environment: bool,
     pub(super) preparation_policy: Option<PreparationPolicy>,
@@ -313,6 +325,7 @@ impl WorkspaceConfiguration {
         self.source_repos == other.source_repos
             && self.setup_commands == other.setup_commands
             && self.clone_requests == other.clone_requests
+            && self.factory_definition_sha == other.factory_definition_sha
     }
 
     /// Reports whether the workspace requires setup before harness startup.
@@ -342,6 +355,8 @@ impl WorkspaceConfiguration {
             deferred_repos: Vec::new(),
             setup_commands,
             factory_skill_dirs: None,
+            definition_skill_dirs: None,
+            factory_definition_sha: None,
             has_environment: environment.is_some(),
             clone_requests,
             preparation_policy: None,
@@ -364,6 +379,8 @@ impl WorkspaceConfiguration {
             deferred_repos,
             setup_commands,
             factory_skill_dirs: None,
+            definition_skill_dirs: None,
+            factory_definition_sha: None,
             has_environment: false,
             clone_requests,
             preparation_policy: None,
@@ -451,6 +468,8 @@ pub(crate) fn prepare_environment(
             source_repos,
             setup_commands,
             factory_skill_dirs: _,
+            definition_skill_dirs: _,
+            factory_definition_sha: _,
             clone_requests,
             has_environment: _,
             deferred_repos: _,
@@ -539,9 +558,11 @@ pub(crate) const FACTORY_REPO_DIR_ENV_VAR: &str = "WARP_FACTORY_REPO_DIR";
 
 /// Prepends the setup command that clones a Factory's definition repository
 /// when the dispatch attached the clone variables to this run, so the checkout
-/// exists before user-declared setup commands run.
+/// exists before user-declared setup commands run. `checkout_sha` additionally
+/// moves the clone to that commit.
 pub(super) fn prepend_factory_definition_clone(
     setup_commands: &mut Vec<String>,
+    checkout_sha: Option<&str>,
     shell_type: Option<ShellType>,
 ) {
     let clone_url = std::env::var(FACTORY_REPO_CLONE_URL_ENV_VAR).unwrap_or_default();
@@ -549,15 +570,18 @@ pub(super) fn prepend_factory_definition_clone(
     prepend_factory_definition_clone_for_values(
         &clone_url,
         &clone_dir,
+        checkout_sha,
         shell_type.unwrap_or(ShellType::Bash),
         setup_commands,
     );
 }
 
-/// Adds the Factory clone command from supplied variables without reading process state.
+/// Adds the Factory clone command, and a checkout of `checkout_sha` directly after it, from
+/// supplied variables without reading process state.
 pub(crate) fn prepend_factory_definition_clone_for_values(
     clone_url: &str,
     clone_dir: &str,
+    checkout_sha: Option<&str>,
     shell_type: ShellType,
     setup_commands: &mut Vec<String>,
 ) {
@@ -566,32 +590,52 @@ pub(crate) fn prepend_factory_definition_clone_for_values(
     }
     // Environments provisioned before run-scoped cloning still persist their
     // own copy of the clone command; leave that copy in charge rather than
-    // attempting the checkout twice.
-    if setup_commands
+    // cloning twice.
+    let checkout_position = match setup_commands
         .iter()
-        .any(|command| command.contains(FACTORY_REPO_CLONE_URL_ENV_VAR))
+        .position(|command| command.contains(FACTORY_REPO_CLONE_URL_ENV_VAR))
     {
-        return;
+        Some(persisted_clone) => persisted_clone + 1,
+        None => {
+            // The command expands the variables in the session shell instead of
+            // inlining their values so the credential-bearing URL never appears in
+            // command text. There is deliberately no existence guard: a bare clone
+            // into an already-present target directory fails, which is treated as a
+            // fatal setup-command error upstream.
+            setup_commands.insert(0, factory_definition_clone_command(shell_type));
+            1
+        }
+    };
+    if let Some(sha) = checkout_sha {
+        setup_commands.insert(
+            checkout_position,
+            factory_definition_checkout_command(shell_type, sha),
+        );
     }
-    // The command expands the variables in the session shell instead of
-    // inlining their values so the credential-bearing URL never appears in
-    // command text. There is deliberately no existence guard: a bare clone
-    // into an already-present target directory fails, which is treated as a
-    // fatal setup-command error upstream.
-    setup_commands.insert(0, factory_definition_clone_command(shell_type));
+}
+
+fn shell_env_var_reference(shell_type: ShellType, name: &str) -> String {
+    // PowerShell reads environment variables through the `env:` drive; a bare `$NAME` there is
+    // an unset PowerShell variable that expands to an empty string.
+    match shell_type {
+        ShellType::PowerShell => format!("$env:{name}"),
+        ShellType::Zsh | ShellType::Bash | ShellType::Fish => format!("${name}"),
+    }
 }
 
 fn factory_definition_clone_command(shell_type: ShellType) -> String {
-    // PowerShell reads environment variables through the `env:` drive; a bare `$NAME` there is
-    // an unset PowerShell variable that expands to an empty string.
-    let env_var_reference = |name: &str| match shell_type {
-        ShellType::PowerShell => format!("$env:{name}"),
-        ShellType::Zsh | ShellType::Bash | ShellType::Fish => format!("${name}"),
-    };
     format!(
         "git clone \"{}\" \"{}\"",
-        env_var_reference(FACTORY_REPO_CLONE_URL_ENV_VAR),
-        env_var_reference(FACTORY_REPO_DIR_ENV_VAR)
+        shell_env_var_reference(shell_type, FACTORY_REPO_CLONE_URL_ENV_VAR),
+        shell_env_var_reference(shell_type, FACTORY_REPO_DIR_ENV_VAR)
+    )
+}
+
+/// A missing commit fails setup rather than leaving the run on the default branch's definition.
+fn factory_definition_checkout_command(shell_type: ShellType, sha: &str) -> String {
+    format!(
+        "git -C \"{}\" -c advice.detachedHead=false checkout --quiet --detach {sha}",
+        shell_env_var_reference(shell_type, FACTORY_REPO_DIR_ENV_VAR)
     )
 }
 
@@ -634,7 +678,8 @@ async fn prepare_environment_impl(
     } else {
         setup_events
             .record_result(SetupStep::EnvironmentRepoClone, async {
-                clone_checkout_requests(&repository_clone_requests, working_dir, spawner).await
+                clone_checkout_requests(&repository_clone_requests, working_dir, spawner, true)
+                    .await
             })
             .await?
     };
@@ -1022,9 +1067,12 @@ async fn remove_repository_origins_from_repos(
         .cloned()
         .collect::<Vec<_>>();
     let batch = checkout_requests_batch(&selected, working_dir)?;
-    let result = execute_checkout_helper(&batch, true, spawner)
+    let result = execute_checkout_helper(&batch, true, false, spawner)
         .await
-        .map_err(|_| PrepareEnvironmentError::RemoveRepositoryOrigins)?;
+        .map_err(|error| match error {
+            error @ PrepareEnvironmentError::CheckoutHelperTimedOut { .. } => error,
+            _ => PrepareEnvironmentError::RemoveRepositoryOrigins,
+        })?;
     if result.command_result.exit_code == 0.into() {
         Ok(())
     } else {
@@ -1043,6 +1091,7 @@ pub(super) async fn clone_repos(
         &repository_clone_requests(repos, &[], false)?,
         working_dir,
         spawner,
+        false,
     )
     .await
     .map(|_| ())
@@ -1054,6 +1103,7 @@ fn build_checkout_helper_command(
     requests_file: &Path,
     report_file: &Path,
     remove_origins_only: bool,
+    legacy_preparation: bool,
     shell_type: ShellType,
 ) -> String {
     let quote = |path: &Path| {
@@ -1062,18 +1112,26 @@ fn build_checkout_helper_command(
             shell_escape_single_quotes(&path.to_string_lossy(), shell_type)
         )
     };
-    let prefix = if shell_type == ShellType::PowerShell {
-        "& "
+    // The release Windows CLI is a GUI-subsystem binary, and PowerShell only waits for one when
+    // its output is consumed by the pipeline. Without the trailing `| Out-Host` the block ends as
+    // soon as the helper is spawned and the driver reads the report file before it is written.
+    let (prefix, suffix) = if shell_type == ShellType::PowerShell {
+        ("& ", " | Out-Host")
     } else {
-        ""
+        ("", "")
     };
     let operation = if remove_origins_only {
         " --remove-origins-only"
     } else {
         ""
     };
+    let preparation = if legacy_preparation {
+        " --legacy-preparation"
+    } else {
+        ""
+    };
     format!(
-        "{prefix}{} environment-checkout --requests-file {} --report-file {}{operation}",
+        "{prefix}{} environment-checkout --requests-file {} --report-file {}{operation}{preparation}{suffix}",
         quote(executable),
         quote(requests_file),
         quote(report_file)
@@ -1204,6 +1262,18 @@ struct CheckoutHelperResult {
     report: Option<CheckoutReport>,
 }
 
+async fn await_checkout_helper<T>(
+    operation: impl Future<Output = Result<T, PrepareEnvironmentError>>,
+    deadline: impl Future,
+) -> Result<T, PrepareEnvironmentError> {
+    match select(Box::pin(operation), Box::pin(deadline)).await {
+        Either::Left((result, _)) => result,
+        Either::Right((_, _)) => Err(PrepareEnvironmentError::CheckoutHelperTimedOut {
+            timeout_seconds: CHECKOUT_HELPER_TIMEOUT.as_secs(),
+        }),
+    }
+}
+
 #[tracing::instrument(skip_all, err, fields(
     tags.cloud_agent = true,
     remove_origins_only = remove_origins_only,
@@ -1211,6 +1281,7 @@ struct CheckoutHelperResult {
 async fn execute_checkout_helper(
     batch: &CheckoutBatch,
     remove_origins_only: bool,
+    legacy_preparation: bool,
     spawner: &ModelSpawner<TerminalDriver>,
 ) -> Result<CheckoutHelperResult, PrepareEnvironmentError> {
     #[cfg(unix)]
@@ -1244,9 +1315,14 @@ async fn execute_checkout_helper(
         &requests_file,
         &report_file,
         remove_origins_only,
+        legacy_preparation,
         active_shell_type(spawner).await,
     );
-    let result = execute_command(command, spawner).await;
+    let result = await_checkout_helper(
+        execute_command(command, spawner),
+        Timer::after(CHECKOUT_HELPER_TIMEOUT),
+    )
+    .await;
     let _ = std::fs::remove_file(&requests_file);
     let command_result = result?;
     let report = read_checkout_report(&report_file, batch.repositories.len());
@@ -1259,11 +1335,184 @@ async fn execute_checkout_helper(
     })
 }
 
+async fn checkout_with_clone_retry<Execute, Execution>(
+    batch: &CheckoutBatch,
+    mut execute: Execute,
+    delay: impl Future<Output = ()>,
+) -> Result<CheckoutHelperResult, PrepareEnvironmentError>
+where
+    Execute: FnMut(CheckoutBatch) -> Execution,
+    Execution: Future<Output = Result<CheckoutHelperResult, PrepareEnvironmentError>>,
+{
+    let mut result = execute(batch.clone()).await?;
+    if result.command_result.exit_code == 0.into() {
+        return Ok(result);
+    }
+    let Some(report) = &mut result.report else {
+        return Ok(result);
+    };
+    let first_report_complete = report.outcomes.len() == batch.repositories.len();
+    let indexes = report
+        .failures()
+        .filter(|failure| failure.failure == Some(CheckoutFailureKind::Clone))
+        .map(|failure| failure.request_index)
+        .collect::<Vec<_>>();
+    if indexes.is_empty() {
+        return Ok(result);
+    }
+    let retry_batch = CheckoutBatch {
+        working_dir: batch.working_dir.clone(),
+        repositories: indexes
+            .iter()
+            .map(|&index| batch.repositories[index].clone())
+            .collect(),
+    };
+    let names = retry_batch
+        .repositories
+        .iter()
+        .map(|request| request.checkout_name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    safe_info!(
+        safe: ("Retrying {} environment clones once: reason=clone_failure", indexes.len()),
+        full: ("Retrying environment clones once: repos={names} reason=clone_failure")
+    );
+    delay.await;
+    let retry = execute(retry_batch).await;
+    let retry_ok = retry
+        .as_ref()
+        .is_ok_and(|retry| retry.command_result.exit_code == 0.into());
+    safe_info!(
+        safe: ("Environment clone retry finished: result_ok={retry_ok}"),
+        full: ("Environment clone retry finished: repos={names} result_ok={retry_ok}")
+    );
+    let retry_report_complete = merge_checkout_retry_report(report, retry?.report, &indexes);
+    annotate_clone_retry_failures(report, batch, &indexes, retry_report_complete);
+    if retry_ok
+        && retry_report_complete
+        && first_report_complete
+        && report.failures().next().is_none()
+    {
+        result.command_result.exit_code = 0.into();
+    }
+    Ok(result)
+}
+
+fn merge_checkout_retry_report(
+    report: &mut CheckoutReport,
+    retry_report: Option<CheckoutReport>,
+    indexes: &[usize],
+) -> bool {
+    let Some(retry_report) = retry_report.filter(|report| report.outcomes.len() == indexes.len())
+    else {
+        return false;
+    };
+    merge_clone_failure_identity(
+        &mut report.identity_diagnostics,
+        retry_report.identity_diagnostics,
+    );
+    report
+        .outcomes
+        .retain(|outcome| !indexes.contains(&outcome.request_index));
+    for mut outcome in retry_report.outcomes {
+        outcome.request_index = indexes[outcome.request_index];
+        report.outcomes.push(outcome);
+    }
+    true
+}
+
+fn merge_clone_failure_identity(
+    current: &mut Option<CloneFailureIdentityDiagnostics>,
+    latest: Option<CloneFailureIdentityDiagnostics>,
+) {
+    let Some(mut latest) = latest else {
+        return;
+    };
+    if let Some(previous) = current.take() {
+        latest.author = latest.author.or(previous.author);
+        for credential in previous.credentials {
+            if let Some(updated) = latest
+                .credentials
+                .iter_mut()
+                .find(|updated| updated.host == credential.host)
+            {
+                if updated.username.is_none() {
+                    updated.username = credential.username;
+                }
+            } else {
+                latest.credentials.push(credential);
+            }
+        }
+    }
+    *current = Some(latest);
+}
+
+fn annotate_clone_retry_failures(
+    report: &mut CheckoutReport,
+    batch: &CheckoutBatch,
+    indexes: &[usize],
+    retry_report_complete: bool,
+) {
+    let reason = if retry_report_complete {
+        "still failed"
+    } else {
+        "failed without a complete checkout report"
+    };
+    for outcome in &mut report.outcomes {
+        if indexes.contains(&outcome.request_index) && outcome.failure.is_some() {
+            outcome.diagnostics = format!(
+                "{}\n{}: clone was retried once and {reason}.",
+                outcome.diagnostics, batch.repositories[outcome.request_index].checkout_name
+            );
+        }
+    }
+}
+
+/// Runs `batch` through the checkout helper, returning its report, or `None` when the helper
+/// produced none. Per-request failures are left in the report. A helper still running at the
+/// deadline is interrupted, so the session is free for the run.
+pub(super) fn checkout_skill_sources(
+    batch: CheckoutBatch,
+    ctx: &mut ModelContext<TerminalDriver>,
+) -> impl Future<Output = Option<CheckoutReport>> + use<> {
+    let spawner = ctx.spawner();
+    // The execution preparation policy covers only the run's own repositories, so skill sources
+    // check out under legacy preparation instead. Credentials are unchanged.
+    let legacy_preparation = true;
+    async move {
+        let checkout = Box::pin(execute_checkout_helper(
+            &batch,
+            false,
+            legacy_preparation,
+            &spawner,
+        ));
+        let deadline = Box::pin(Timer::after(SKILL_SOURCE_CHECKOUT_TIMEOUT));
+        let result = match select(checkout, deadline).await {
+            Either::Left((result, _)) => result,
+            Either::Right((_, checkout)) => {
+                log::warn!("Skill source checkout timed out; interrupting it");
+                let _ = spawner
+                    .spawn(|driver, ctx| driver.send_interrupt_to_pty(ctx))
+                    .await;
+                checkout.await
+            }
+        };
+        match result {
+            Ok(result) => result.report,
+            Err(error) => {
+                log::warn!("Skill source checkout did not run: {error}");
+                None
+            }
+        }
+    }
+}
+
 #[tracing::instrument(skip_all, err, fields(tags.cloud_agent = true))]
 async fn clone_checkout_requests(
     repos: &[RepositoryCloneRequest],
     working_dir: &Path,
     spawner: &ModelSpawner<TerminalDriver>,
+    retry_clone_failures: bool,
 ) -> Result<EnvironmentSnapshot, PrepareEnvironmentError> {
     if repos.is_empty() {
         return Ok(EnvironmentSnapshot::empty());
@@ -1272,7 +1521,45 @@ async fn clone_checkout_requests(
     let CheckoutHelperResult {
         command_result,
         mut report,
-    } = execute_checkout_helper(&batch, false, spawner).await?;
+    } = if retry_clone_failures {
+        checkout_with_clone_retry(
+            &batch,
+            |batch| async move { execute_checkout_helper(&batch, false, false, spawner).await },
+            async {
+                Timer::after(CLONE_RETRY_DELAY).await;
+            },
+        )
+        .await?
+    } else {
+        execute_checkout_helper(&batch, false, false, spawner).await?
+    };
+    if command_result.exit_code != 0.into() {
+        let fallback_output = if report
+            .as_ref()
+            .is_some_and(|report| report.failures().next().is_some())
+        {
+            None
+        } else {
+            fetch_clone_failure_output(&command_result.block_id, spawner).await
+        };
+        return Err(checkout_failure_error(
+            repos,
+            report.take(),
+            fallback_output,
+        ));
+    }
+    let resolved_heads = report
+        .as_ref()
+        .map(|report| reported_resolved_heads(report, &batch))
+        .unwrap_or_default();
+    Ok(environment_snapshot(repos, working_dir, &resolved_heads))
+}
+
+fn checkout_failure_error(
+    repos: &[RepositoryCloneRequest],
+    mut report: Option<CheckoutReport>,
+    fallback_output: Option<String>,
+) -> PrepareEnvironmentError {
     let identity_diagnostics = report
         .as_mut()
         .and_then(|report| report.identity_diagnostics.take())
@@ -1281,57 +1568,50 @@ async fn clone_checkout_requests(
         .as_ref()
         .map(|report| report.failures().collect::<Vec<_>>())
         .filter(|failures| !failures.is_empty());
-    if command_result.exit_code != 0.into() {
-        let failed_requests = match &failures {
-            Some(failures) => failures
-                .iter()
-                .map(|failure| &repos[failure.request_index])
-                .collect(),
-            None => repos.iter().collect::<Vec<_>>(),
-        };
-        let repo_name = failed_requests
+    let failed_requests = match &failures {
+        Some(failures) => failures
             .iter()
-            .map(|request| request.remote.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        if let Some(failures) = &failures
-            && failures
-                .iter()
-                .all(|failure| failure.failure == Some(CheckoutFailureKind::Checkout))
-        {
-            return Err(PrepareEnvironmentError::CheckoutFailed {
-                repo_name,
-                checkout_ref: failed_requests
-                    .iter()
-                    .filter_map(|request| request.checkout.as_ref())
-                    .map(RepositoryHeadRef::value)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                identity_diagnostics,
-            });
-        }
-        let output = match failures {
-            Some(failures) => Some(failure_output::prepare_failure_output(
-                &failures
-                    .iter()
-                    .map(|failure| failure.diagnostics.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                CLONE_FAILURE_OUTPUT_TRUNCATION_MARKER,
-            )),
-            None => fetch_clone_failure_output(&command_result.block_id, spawner).await,
-        };
-        return Err(PrepareEnvironmentError::CloneRepo {
+            .map(|failure| &repos[failure.request_index])
+            .collect(),
+        None => repos.iter().collect::<Vec<_>>(),
+    };
+    let repo_name = failed_requests
+        .iter()
+        .map(|request| request.remote.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(failures) = &failures
+        && failures
+            .iter()
+            .all(|failure| failure.failure == Some(CheckoutFailureKind::Checkout))
+    {
+        return PrepareEnvironmentError::CheckoutFailed {
             repo_name,
-            output,
+            checkout_ref: failed_requests
+                .iter()
+                .filter_map(|request| request.checkout.as_ref())
+                .map(RepositoryHeadRef::value)
+                .collect::<Vec<_>>()
+                .join(", "),
             identity_diagnostics,
-        });
+        };
     }
-    let resolved_heads = report
-        .as_ref()
-        .map(|report| reported_resolved_heads(report, &batch))
-        .unwrap_or_default();
-    Ok(environment_snapshot(repos, working_dir, &resolved_heads))
+    let output = match failures {
+        Some(failures) => Some(failure_output::prepare_failure_output(
+            &failures
+                .iter()
+                .map(|failure| failure.diagnostics.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            CLONE_FAILURE_OUTPUT_TRUNCATION_MARKER,
+        )),
+        None => fallback_output,
+    };
+    PrepareEnvironmentError::CloneRepo {
+        repo_name,
+        output,
+        identity_diagnostics,
+    }
 }
 
 /// Register a cloned source repository with `DetectedRepositories` so that the

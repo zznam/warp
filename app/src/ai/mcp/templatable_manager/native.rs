@@ -3,12 +3,14 @@ use std::sync::Arc;
 
 use async_compat::CompatExt as _;
 use futures::channel::oneshot;
+use http_client::is_warp_server_origin;
 use mcp::oauth::{
     self, AuthContext, CallbackResult, FILE_BASED_MCP_CREDENTIALS_KEY,
     FileBasedPersistedCredentialsMap, OAuthCallbackMode, PersistedCredentials,
     PersistedCredentialsMap, TEMPLATABLE_MCP_CREDENTIALS_KEY, load_credentials_from_secure_storage,
     write_to_secure_storage,
 };
+use mcp::refreshable_headers::RefreshableHeaders;
 use mcp::runtime::{error_to_user_message, spawn_server};
 use parking_lot::Mutex;
 use simple_logger::manager::LogManager;
@@ -430,6 +432,7 @@ impl TemplatableMCPServerManager {
             runtime_environment: Default::default(),
             spawned_servers: Default::default(),
             reconnectable_ephemeral_installations: Default::default(),
+            refreshable_headers: Default::default(),
             server_credentials: Default::default(),
             file_based_server_credentials: Default::default(),
             locally_installed_servers,
@@ -788,13 +791,25 @@ impl TemplatableMCPServerManager {
         );
     }
 
-    /// Spawns an ephemeral MCP server started via the CLI (`oz agent run --mcp`).
+    /// Spawns an ephemeral MCP server started via the CLI (`oz agent run --mcp`). With
+    /// `refreshable_headers`, its connection sends those headers, which their owner can replace
+    /// while the server runs.
     pub fn spawn_cli_ephemeral_server(
         &mut self,
         installation: TemplatableMCPServerInstallation,
+        refreshable_headers: Option<RefreshableHeaders>,
         ctx: &mut ModelContext<Self>,
     ) {
         self.cli_spawned_server_uuids.insert(installation.uuid());
+        match refreshable_headers {
+            Some(refreshable_headers) => {
+                self.refreshable_headers
+                    .insert(installation.uuid(), refreshable_headers);
+            }
+            None => {
+                self.refreshable_headers.remove(&installation.uuid());
+            }
+        }
         self.spawn_ephemeral_server(installation, ctx);
     }
 
@@ -949,7 +964,15 @@ impl TemplatableMCPServerManager {
             }
         };
 
-        self.apply_runtime_environment(&mut server.transport_type);
+        if let Err(error) = self.apply_runtime_environment(&mut server.transport_type) {
+            log::error!("Could not apply managed MCP authentication environment: {error:#}");
+            self.change_server_state(installation_uuid, MCPServerState::FailedToStart, ctx);
+            self.notify_reconnect_waiters(
+                installation_uuid,
+                Err("Managed authentication environment is unavailable".into()),
+            );
+            return;
+        }
         // If we're executing a CLI MCP server, ensure that the environment variables includes
         // PATH.
         if let TransportType::CLIServer(cli_server) = &mut server.transport_type {
@@ -1163,6 +1186,11 @@ impl TemplatableMCPServerManager {
         let should_persist = mode.should_persist_running_state_to_sqlite();
         let should_send_telemetry = mode.should_send_telemetry();
 
+        let refreshable_headers = with_warp_server_iap_headers(
+            self.refreshable_headers.get(&installation_uuid).cloned(),
+            &server.transport_type,
+            ctx,
+        );
         self.change_server_state(installation_uuid, MCPServerState::Starting, ctx);
         let task = ctx.spawn(
             spawn_server(
@@ -1173,6 +1201,7 @@ impl TemplatableMCPServerManager {
                 server.transport_type.clone(),
                 logger.clone(),
                 auth_context,
+                refreshable_headers,
             )
             .compat(),
             move |me, server_info: Result<_, rmcp::RmcpError>, ctx| {
@@ -1278,6 +1307,7 @@ impl TemplatableMCPServerManager {
         }
         self.reconnectable_ephemeral_installations
             .remove(&installation_uuid);
+        self.refreshable_headers.remove(&installation_uuid);
         self.notify_reconnect_waiters(installation_uuid, Err("Server shut down".to_string()));
         // Close the log stream now rather than when async teardown drops the
         // last logger clone, so an immediate respawn of the same server can
@@ -2030,4 +2060,35 @@ impl TemplatableMCPServerManager {
         self.file_based_server_credentials
             .contains_key(&installation_hash)
     }
+}
+
+/// Adds the Warp client's IAP headers, read on every request, to an HTTP connection to
+/// warp-server: staging IAP routing rejects warp-server requests without them. Other servers, and
+/// builds without IAP, get `refreshable_headers` back unchanged.
+fn with_warp_server_iap_headers(
+    refreshable_headers: Option<RefreshableHeaders>,
+    transport_type: &TransportType,
+    ctx: &AppContext,
+) -> Option<RefreshableHeaders> {
+    let TransportType::ServerSentEvents(server) = transport_type else {
+        return refreshable_headers;
+    };
+    let is_warp_server = Url::parse(&server.url).is_ok_and(|url| is_warp_server_origin(&url));
+    if !is_warp_server
+        || ChannelState::iap_config().is_none()
+        || !ctx.has_singleton_model::<ServerApiProvider>()
+    {
+        return refreshable_headers;
+    }
+    let refreshable_headers =
+        refreshable_headers.or_else(|| RefreshableHeaders::new(HashMap::new(), None).ok())?;
+    let server_api = ServerApiProvider::as_ref(ctx).get();
+    refreshable_headers.set_source(Arc::new(move || {
+        server_api
+            .iap_headers()
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect()
+    }));
+    Some(refreshable_headers)
 }

@@ -9,6 +9,7 @@ use crate::schema;
 pub struct ExecutionBootstrapVariables {
     pub execution_id: cynic::Id,
     pub supports_deferred_repositories: bool,
+    pub supports_session_agent_messages: bool,
     pub secrets_input: TaskSecretsInput,
     pub task_input: TaskInput,
     pub request_context: RequestContext,
@@ -29,9 +30,13 @@ impl ExecutionBootstrap {
     ) -> Result<cynic::Operation<Self, ExecutionBootstrapVariables>, cynic::OperationBuildError>
     {
         let supports_deferred_repositories = variables.supports_deferred_repositories;
+        let supports_session_agent_messages = variables.supports_session_agent_messages;
         let mut builder = cynic::OperationBuilder::query().with_variables(variables);
         if supports_deferred_repositories {
             builder = builder.with_feature_enabled("deferred_repositories");
+        }
+        if supports_session_agent_messages {
+            builder = builder.with_feature_enabled("session_agent_messages");
         }
         builder.build()
     }
@@ -59,13 +64,15 @@ pub struct BootstrapTaskOutput {
 #[derive(cynic::QueryFragment, Debug)]
 #[cynic(graphql_type = "Task", variables = "ExecutionBootstrapVariables")]
 pub struct BootstrapTask {
-    #[arguments(executionId: $execution_id, supportsDeferredRepositories: $supports_deferred_repositories)]
+    #[arguments(executionId: $execution_id, supportsDeferredRepositories: $supports_deferred_repositories, supportsAgentHooks: true, supportsSessionAgentMessages: $supports_session_agent_messages)]
     pub execution_config: ExecutionConfiguration,
     pub attachments: Vec<TaskAttachment>,
 }
 
 #[derive(cynic::QueryFragment, Debug)]
 pub struct ExecutionConfiguration {
+    #[cynic(feature = "session_agent_messages")]
+    pub session_agent_messages: Option<bool>,
     pub task_id: cynic::Id,
     pub execution_id: cynic::Id,
     pub conversation_id: Option<cynic::Id>,
@@ -78,6 +85,7 @@ pub struct ExecutionConfiguration {
     pub mcp_servers_json: String,
     pub skills: Vec<ExecutionSkillSpec>,
     pub factory_skill_dirs: Vec<String>,
+    pub factory_branch: Option<FactoryBranchExecutionConfig>,
     pub computer_use_enabled: bool,
     pub computer_use_model_id: Option<String>,
     pub inference_providers: Option<InferenceProviderClientConfigs>,
@@ -91,11 +99,62 @@ pub struct ExecutionConfiguration {
     pub idle_on_complete_seconds: Option<i32>,
     pub idle_on_fail_seconds: Option<i32>,
     pub snapshot_disabled: bool,
+    pub agent_hook_sources: Vec<AgentHookSource>,
+}
+
+#[derive(cynic::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentHookFormat {
+    #[cynic(rename = "CURSOR")]
+    Cursor,
+    #[cynic(fallback)]
+    Unknown,
+}
+
+#[derive(cynic::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentHookLevel {
+    #[cynic(rename = "FACTORY")]
+    Factory,
+    #[cynic(rename = "AGENT")]
+    Agent,
+    #[cynic(fallback)]
+    Unknown,
+}
+
+#[derive(cynic::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentHookOnAsk {
+    #[cynic(rename = "DENY")]
+    Deny,
+    #[cynic(rename = "FAIL_RUN")]
+    FailRun,
+    #[cynic(fallback)]
+    Unknown,
+}
+
+#[derive(cynic::QueryFragment, Clone, Debug)]
+pub struct AgentHookRepository {
+    pub forge: CodeForge,
+    pub owner: String,
+    pub name: String,
+}
+
+#[derive(cynic::QueryFragment, Clone, Debug)]
+pub struct AgentHookSource {
+    pub format: AgentHookFormat,
+    pub repository: Option<AgentHookRepository>,
+    pub path: String,
+    pub level: AgentHookLevel,
+    pub strict: bool,
+    pub on_ask: AgentHookOnAsk,
 }
 
 #[derive(cynic::QueryFragment, Debug)]
 pub struct ExecutionSkillSpec {
     pub spec: String,
+}
+
+#[derive(cynic::QueryFragment, Clone, Debug)]
+pub struct FactoryBranchExecutionConfig {
+    pub source_sha: String,
 }
 
 #[derive(cynic::Enum, Clone, Copy, Debug, PartialEq, Eq)]

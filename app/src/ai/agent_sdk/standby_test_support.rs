@@ -45,8 +45,11 @@ impl PrewarmedSandboxClient for FakeClient {
     async fn fetch_configuration(
         &self,
         sandbox_id: &str,
+        supports_deferred_repositories: bool,
     ) -> anyhow::Result<PrewarmedSandboxConfiguration> {
-        panic!("Unexpected configuration fetch for {sandbox_id}")
+        panic!(
+            "Unexpected configuration fetch for {sandbox_id}: support={supports_deferred_repositories}"
+        )
     }
 
     async fn report_status(
@@ -230,6 +233,7 @@ pub(super) fn connection() -> (ConnectionAttempt, TestServer) {
 
 pub(super) fn execution_config() -> ExecutionConfiguration {
     ExecutionConfiguration {
+        session_agent_messages: None,
         task_id: "run-id".into(),
         execution_id: "42".into(),
         conversation_id: None,
@@ -242,6 +246,7 @@ pub(super) fn execution_config() -> ExecutionConfiguration {
         mcp_servers_json: "{}".into(),
         skills: Vec::new(),
         factory_skill_dirs: Vec::new(),
+        factory_branch: None,
         computer_use_enabled: false,
         computer_use_model_id: None,
         inference_providers: None,
@@ -254,6 +259,7 @@ pub(super) fn execution_config() -> ExecutionConfiguration {
         idle_on_complete_seconds: None,
         idle_on_fail_seconds: None,
         snapshot_disabled: true,
+        agent_hook_sources: Vec::new(),
     }
 }
 
@@ -276,6 +282,25 @@ pub(super) async fn drive(
     clock: &TestClock,
     hooks: &Hooks,
     standby_seconds: i64,
+) -> anyhow::Result<()> {
+    drive_with_renewal(
+        preparation,
+        connections,
+        clock,
+        hooks,
+        standby_seconds,
+        future::pending(),
+    )
+    .await
+}
+
+pub(super) async fn drive_with_renewal(
+    preparation: impl Future<Output = anyhow::Result<usize>>,
+    connections: async_channel::Receiver<ConnectionAttempt>,
+    clock: &TestClock,
+    hooks: &Hooks,
+    standby_seconds: i64,
+    renewal: impl Future<Output = anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     run_lifecycle(
         "abc123",
@@ -314,6 +339,7 @@ pub(super) async fn drive(
             .boxed()
         },
         &clock.clock(),
+        renewal,
     )
     .await
 }

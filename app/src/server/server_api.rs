@@ -33,6 +33,7 @@ use factory::FactoryClient;
 use instant::Instant;
 use managed_mcp::ManagedMcpClient;
 use managed_secrets::AppManagedSecretsClient;
+use non_structural_derive::non_structural_derive;
 use object::ObjectClient;
 use parking_lot::Mutex;
 use referral::ReferralsClient;
@@ -73,10 +74,6 @@ use crate::settings::PrivacySettingsSnapshot;
 use crate::{ChannelState, settings_view};
 
 pub const FETCH_CHANNEL_VERSIONS_TIMEOUT: std::time::Duration = Duration::from_secs(60);
-#[derive(Serialize)]
-struct AgentTipShownAnalyticsRequest {
-    tip: String,
-}
 
 /// We use a special error code header `X-Warp-Error-Code` to allow the server to send
 /// more specific error code information, so that the client can discern between different
@@ -437,8 +434,16 @@ register_error!(TranscribeError);
 /// Prefer NOT adding new methods directly on this struct; instead, add to one of the existing
 /// client trait objects, or create your own. This helps keep `ServerApi` from being overloaded
 /// with disparate types of calls, and allows you to mock methods in tests.
+//
+// `Send` and `Sync` are implemented explicitly, rather than left to the compiler's auto-trait
+// rules, to save compile time. rustc does not share auto-trait results between async functions,
+// so each async method that needs `ServerApi: Send` or `ServerApi: Sync` would otherwise re-check
+// every type reachable from these fields, down through the HTTP client internals. The macro still
+// verifies that each field is `Send` and `Sync`.
+#[non_structural_derive(Send, Sync)]
 pub struct ServerApi {
     base_client: Arc<BaseClient>,
+    session_message_task: Mutex<Option<String>>,
     // TODO(jeff): Make `TelemetryApi` another type of client, and move it off `ServerApi`.
     telemetry_api: TelemetryApi,
     last_server_time: Arc<Mutex<Option<ServerTime>>>,
@@ -509,6 +514,7 @@ impl ServerApi {
             base_client,
             telemetry_api,
             last_server_time: Arc::new(Mutex::new(None)),
+            session_message_task: Mutex::new(None),
         }
     }
 
@@ -520,7 +526,7 @@ impl ServerApi {
 
         Self::new_with_parts(
             client,
-            Arc::new(http_client::Client::new_external()),
+            Arc::new(http_client::Client::new_external_for_test()),
             auth_state,
             tx,
             None,
@@ -540,13 +546,17 @@ impl ServerApi {
         }
         Self::new_with_parts(
             Arc::new(http_client::Client::new_for_test()),
-            Arc::new(http_client::Client::new_external()),
+            Arc::new(http_client::Client::new_external_for_test()),
             auth_state,
             event_sender,
             None,
             None,
             TelemetryApi::new(),
         )
+    }
+
+    pub(crate) fn uses_session_agent_messages(&self, task_id: &str) -> bool {
+        self.session_message_task.lock().as_deref() == Some(task_id)
     }
 
     /// Sets the ambient agent task ID to be sent with all subsequent requests.
@@ -1107,41 +1117,6 @@ impl ServerApi {
         self.telemetry_api
             .send_telemetry_event(user_id, anonymous_id, event, settings_snapshot)
             .await
-    }
-
-    pub async fn send_agent_tip_shown_analytics_event(&self, tip: String) -> Result<()> {
-        let auth_token = self
-            .get_or_refresh_access_token()
-            .await
-            .context("Failed to get access token for API request")?;
-        let url = format!(
-            "{}/analytics/agent-tip-shown",
-            ChannelState::server_root_url()
-        );
-        let mut request = self
-            .base_client
-            .http_client()
-            .post(&url)
-            .json(&AgentTipShownAnalyticsRequest { tip });
-        if let Some(token) = auth_token.as_bearer_token() {
-            request = request.bearer_auth(token);
-        }
-
-        for (name, value) in self.ambient_agent_headers().await? {
-            request = request.header(name, value);
-        }
-
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("Failed to send API request to {url}"))?;
-
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            self.observe_iap_challenge(&response);
-            Err(Self::error_from_response(response).await)
-        }
     }
 
     /// Drains all queued [`TelemetryEvent`]s into Rudderstack requests containing the corresponding

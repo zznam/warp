@@ -13,19 +13,302 @@ use warp_cli::agent::{
 use warp_core::command::ExitCode;
 
 use super::super::environment_checkout_protocol::{
-    CheckoutBatch, CheckoutRequest, ResolvedHeads, is_valid_git_object_id,
+    CheckoutBatch, CheckoutFailureKind, CheckoutOutcome, CheckoutReport, CheckoutRequest,
+    CloneFailureCredentialIdentity, ResolvedHeads, is_valid_git_object_id,
 };
 use super::{
-    CloneFailureIdentityDiagnostics, PrepareEnvironmentError, RepositoryCloneRequest,
-    ResolvedRepository, SETUP_COMMAND_OUTPUT_TRUNCATION_MARKER, SetupCommandPhase,
-    WorkspaceConfiguration, await_setup_phase, build_checkout_helper_command, environment_snapshot,
-    merge_repos_deduped, parse_resolved_head_sha, read_checkout_report, reported_resolved_heads,
+    CheckoutHelperResult, CloneFailureIdentityDiagnostics, ExecutedCommand,
+    PrepareEnvironmentError, RepositoryCloneRequest, ResolvedRepository,
+    SETUP_COMMAND_OUTPUT_TRUNCATION_MARKER, SetupCommandPhase, WorkspaceConfiguration,
+    await_checkout_helper, await_setup_phase, build_checkout_helper_command,
+    checkout_failure_error, checkout_with_clone_retry, environment_snapshot, merge_repos_deduped,
+    parse_resolved_head_sha, read_checkout_report, reported_resolved_heads,
     repository_clone_requests, setup_command_failure, single_repo_name,
     validate_repository_preparation_overrides,
 };
 use crate::ai::agent_sdk::driver::AgentDriverError;
 use crate::ai::cloud_environments::{AmbientAgentEnvironment, SourceRepo};
 use crate::terminal::shell::ShellType;
+
+fn checkout_outcome(
+    index: usize,
+    failure: Option<CheckoutFailureKind>,
+    diagnostics: &str,
+) -> CheckoutOutcome {
+    CheckoutOutcome {
+        request_index: index,
+        failure,
+        diagnostics: diagnostics.to_owned(),
+        duration_ms: 0,
+        resolved_head: failure
+            .is_none()
+            .then(|| "0123456789abcdef0123456789abcdef01234567".to_owned()),
+    }
+}
+
+fn checkout_result(outcomes: Vec<CheckoutOutcome>) -> CheckoutHelperResult {
+    CheckoutHelperResult {
+        command_result: ExecutedCommand {
+            exit_code: i32::from(outcomes.iter().any(|outcome| outcome.failure.is_some())).into(),
+            block_id: super::BlockId::new(),
+        },
+        report: Some(CheckoutReport {
+            outcomes,
+            ..Default::default()
+        }),
+    }
+}
+
+#[test]
+fn clone_retry_preserves_successful_checkouts_and_all_resolved_heads() {
+    let batch = checkout_batch(["ready", "rejected", "unknown"]);
+    let mut passes = Vec::new();
+    let mut successful = checkout_outcome(0, None, "");
+    successful.resolved_head = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned());
+    let mut results = [
+        checkout_result(vec![
+            successful,
+            checkout_outcome(1, Some(CheckoutFailureKind::Clone), "Authentication failed"),
+            checkout_outcome(2, Some(CheckoutFailureKind::Clone), ""),
+        ]),
+        checkout_result(vec![
+            checkout_outcome(0, None, ""),
+            checkout_outcome(1, None, ""),
+        ]),
+    ]
+    .into_iter();
+    let mut delays = 0;
+
+    let result = block_on(checkout_with_clone_retry(
+        &batch,
+        |batch| {
+            passes.push(batch.repositories);
+            ready(Ok(results.next().unwrap()))
+        },
+        async {
+            delays += 1;
+        },
+    ))
+    .unwrap();
+
+    assert_eq!(delays, 1);
+    assert_eq!(
+        passes,
+        vec![
+            batch.repositories.clone(),
+            vec![batch.repositories[1].clone(), batch.repositories[2].clone(),]
+        ]
+    );
+    assert_eq!(result.command_result.exit_code, 0.into());
+    let heads = reported_resolved_heads(&result.report.unwrap(), &batch);
+    assert_eq!(
+        heads,
+        ResolvedHeads::from([
+            (
+                "ready".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()
+            ),
+            (
+                "rejected".to_owned(),
+                "0123456789abcdef0123456789abcdef01234567".to_owned()
+            ),
+            (
+                "unknown".to_owned(),
+                "0123456789abcdef0123456789abcdef01234567".to_owned()
+            ),
+        ])
+    );
+}
+
+#[test]
+fn clone_retry_stops_after_second_failure_and_preserves_identity() {
+    let batch = checkout_batch(["first", "second"]);
+    let mut attempts = 0;
+    let result = block_on(checkout_with_clone_retry(
+        &batch,
+        |batch| {
+            attempts += 1;
+            let mut result = checkout_result(
+                batch
+                    .repositories
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| {
+                        checkout_outcome(
+                            index,
+                            Some(CheckoutFailureKind::Clone),
+                            "HTTP Basic: Access denied",
+                        )
+                    })
+                    .collect(),
+            );
+            result.report.as_mut().unwrap().identity_diagnostics =
+                Some(CloneFailureIdentityDiagnostics {
+                    author: Some("Fixture".to_owned()),
+                    credentials: Vec::new(),
+                });
+            ready(Ok(result))
+        },
+        ready(()),
+    ))
+    .unwrap();
+    assert_eq!(attempts, 2);
+    assert_ne!(result.command_result.exit_code, 0.into());
+    let repos = repository_clone_requests(
+        &[
+            repo(CodeForge::GitHub, "warpdotdev", "first"),
+            repo(CodeForge::GitHub, "warpdotdev", "second"),
+        ],
+        &[],
+        false,
+    )
+    .unwrap();
+    let error = checkout_failure_error(&repos, result.report, None);
+    assert!(
+        matches!(&error, PrepareEnvironmentError::CloneRepo { repo_name, .. } if repo_name == "warpdotdev/first, warpdotdev/second")
+    );
+    let message = error.to_string();
+    assert!(message.contains("first: clone was retried once and still failed"));
+    assert!(message.contains("second: clone was retried once and still failed"));
+    assert!(message.contains("Author: Fixture"));
+}
+
+#[test]
+fn clone_retry_retains_identity_for_other_failed_forges() {
+    let mut batch = checkout_batch(["forbidden", "rejected"]);
+    batch.repositories[1].source.code_forge = RepositoryForge::GitLab;
+    let github = CloneFailureCredentialIdentity {
+        host: "github.com".to_owned(),
+        username: Some("github-user".to_owned()),
+    };
+    let gitlab = CloneFailureCredentialIdentity {
+        host: "gitlab.com".to_owned(),
+        username: Some("gitlab-user".to_owned()),
+    };
+    let mut first = checkout_result(vec![
+        checkout_outcome(0, Some(CheckoutFailureKind::Checkout), "HTTP 403"),
+        checkout_outcome(1, Some(CheckoutFailureKind::Clone), "Authentication failed"),
+    ]);
+    first.report.as_mut().unwrap().identity_diagnostics = Some(CloneFailureIdentityDiagnostics {
+        author: Some("Fixture".to_owned()),
+        credentials: vec![github.clone(), gitlab.clone()],
+    });
+    let mut retry = checkout_result(vec![checkout_outcome(
+        0,
+        Some(CheckoutFailureKind::Clone),
+        "Authentication failed",
+    )]);
+    retry.report.as_mut().unwrap().identity_diagnostics = Some(CloneFailureIdentityDiagnostics {
+        author: None,
+        credentials: vec![CloneFailureCredentialIdentity {
+            host: "gitlab.com".to_owned(),
+            username: None,
+        }],
+    });
+    let mut results = [first, retry].into_iter();
+
+    let result = block_on(checkout_with_clone_retry(
+        &batch,
+        |_| ready(Ok(results.next().unwrap())),
+        ready(()),
+    ))
+    .unwrap();
+
+    let identity = result.report.unwrap().identity_diagnostics.unwrap();
+    assert_eq!(identity.author.as_deref(), Some("Fixture"));
+    assert!(identity.credentials.contains(&github));
+    assert!(identity.credentials.contains(&gitlab));
+}
+
+#[test]
+fn clone_retry_does_not_retry_or_delay_other_failure_kinds() {
+    let batch = checkout_batch(["failed"]);
+    for kind in [
+        CheckoutFailureKind::Checkout,
+        CheckoutFailureKind::VerifyHead,
+        CheckoutFailureKind::RemoveOrigin,
+        CheckoutFailureKind::RemoveTarget,
+    ] {
+        let mut attempts = 0;
+        let result = block_on(checkout_with_clone_retry(
+            &batch,
+            |_| {
+                attempts += 1;
+                ready(Ok(checkout_result(vec![checkout_outcome(
+                    0,
+                    Some(kind),
+                    "Authentication failed",
+                )])))
+            },
+            async { panic!("non-clone failures must not delay") },
+        ))
+        .unwrap();
+        assert_eq!(attempts, 1, "{kind:?}");
+        assert_ne!(result.command_result.exit_code, 0.into());
+    }
+}
+
+#[test]
+fn clone_retry_preserves_other_checkout_errors() {
+    let batch = checkout_batch(["forbidden", "rejected"]);
+    let mut results = [
+        checkout_result(vec![
+            checkout_outcome(0, Some(CheckoutFailureKind::Checkout), "HTTP 403"),
+            checkout_outcome(1, Some(CheckoutFailureKind::Clone), "Authentication failed"),
+        ]),
+        checkout_result(vec![checkout_outcome(0, None, "")]),
+    ]
+    .into_iter();
+    let result = block_on(checkout_with_clone_retry(
+        &batch,
+        |_| ready(Ok(results.next().unwrap())),
+        ready(()),
+    ))
+    .unwrap();
+    assert_ne!(result.command_result.exit_code, 0.into());
+    let report = result.report.unwrap();
+    assert_eq!(
+        report
+            .failures()
+            .map(|failure| failure.request_index)
+            .collect::<Vec<_>>(),
+        [0]
+    );
+    assert!(reported_resolved_heads(&report, &batch).contains_key("rejected"));
+}
+
+#[test]
+fn clone_retry_does_not_accept_a_missing_retry_report() {
+    let batch = checkout_batch(["rejected"]);
+    let mut retry = checkout_result(Vec::new());
+    retry.report = None;
+    let mut results = [
+        checkout_result(vec![checkout_outcome(
+            0,
+            Some(CheckoutFailureKind::Clone),
+            "Authentication failed",
+        )]),
+        retry,
+    ]
+    .into_iter();
+    let result = block_on(checkout_with_clone_retry(
+        &batch,
+        |_| ready(Ok(results.next().unwrap())),
+        ready(()),
+    ))
+    .unwrap();
+    assert_ne!(result.command_result.exit_code, 0.into());
+    assert!(
+        result
+            .report
+            .unwrap()
+            .failures()
+            .next()
+            .unwrap()
+            .diagnostics
+            .contains("failed without a complete checkout report")
+    );
+}
 
 #[test]
 fn resolved_repositories_apply_origin_policy_per_checkout() {
@@ -116,6 +399,51 @@ fn duplicate_resolved_repositories_fail_before_clone() {
         })
         .collect::<Vec<_>>();
     assert!(WorkspaceConfiguration::from_resolved(repositories, Vec::new(), Vec::new()).is_err());
+}
+
+#[test]
+fn checkout_helper_timeout_covers_command_start_and_exit() {
+    for command_started in [false, true] {
+        block_on(async {
+            let (start_tx, start_rx) = oneshot::channel::<()>();
+            let (exit_tx, exit_rx) = oneshot::channel::<ExitCode>();
+            let (deadline_tx, deadline_rx) = oneshot::channel::<()>();
+            let operation = async {
+                start_rx.await.unwrap();
+                Ok(exit_rx.await.unwrap())
+            };
+            let mut wait = Box::pin(await_checkout_helper(operation, deadline_rx));
+            assert!(poll!(wait.as_mut()).is_pending());
+            if command_started {
+                start_tx.send(()).unwrap();
+                assert!(poll!(wait.as_mut()).is_pending());
+            }
+            deadline_tx.send(()).unwrap();
+
+            assert!(matches!(
+                wait.await,
+                Err(PrepareEnvironmentError::CheckoutHelperTimedOut {
+                    timeout_seconds: 1800
+                })
+            ));
+            assert!(exit_tx.is_canceled());
+        });
+    }
+}
+
+#[test]
+fn checkout_helper_completion_preserves_command_result() {
+    assert_eq!(
+        block_on(await_checkout_helper(ready(Ok(17)), pending::<()>())).unwrap(),
+        17
+    );
+    assert!(matches!(
+        block_on(await_checkout_helper(
+            ready(Err::<(), _>(PrepareEnvironmentError::InvalidRuntimeState)),
+            pending::<()>()
+        )),
+        Err(PrepareEnvironmentError::InvalidRuntimeState)
+    ));
 }
 
 #[test]
@@ -268,6 +596,7 @@ fn head_probe_timeout_preserves_later_snapshot_repositories() {
         report_file: directory.path().join("report.json"),
         remove_origins_only: false,
         fail_if_target_exists: false,
+        legacy_preparation: false,
     };
     fs::write(&args.requests_file, serde_json::to_vec(&batch).unwrap()).unwrap();
 
@@ -1227,13 +1556,86 @@ fn checkout_helper_quotes_paths_without_embedding_repository_payloads() {
             Path::new("/private/a path/requests.json"),
             Path::new("/private/a path/report.json"),
             true,
+            false,
             shell,
         );
         assert!(command.contains("environment-checkout --requests-file"));
         assert!(command.contains("' --report-file '"));
         assert!(!command.contains("github.com") && !command.contains("sh -c"));
         assert_eq!(command.starts_with("& "), shell == ShellType::PowerShell);
-        assert!(command.ends_with(" --remove-origins-only"));
+        if shell == ShellType::PowerShell {
+            assert!(
+                command.ends_with(" --remove-origins-only | Out-Host"),
+                "{command}"
+            );
+        } else {
+            assert!(command.ends_with(" --remove-origins-only"), "{command}");
+        }
+    }
+}
+
+#[test]
+fn checkout_helper_renders_a_posix_command_without_a_pipeline() {
+    let command = build_checkout_helper_command(
+        Path::new("/Applications/Warp.app/Contents/MacOS/warp"),
+        Path::new("/private/a path/requests.json"),
+        Path::new("/private/a path/report.json"),
+        false,
+        false,
+        ShellType::Bash,
+    );
+    assert_eq!(
+        command,
+        "'/Applications/Warp.app/Contents/MacOS/warp' environment-checkout \
+         --requests-file '/private/a path/requests.json' \
+         --report-file '/private/a path/report.json'"
+    );
+}
+
+/// PowerShell only waits for a GUI-subsystem program when its output is consumed by the
+/// pipeline, so the helper is piped into the host; otherwise the driver would read the report
+/// file before the helper has written it.
+#[test]
+fn checkout_helper_pipes_into_the_host_under_powershell() {
+    let command = build_checkout_helper_command(
+        Path::new(r"C:\Program Files\Warp\warp.exe"),
+        Path::new(r"C:\Temp\oz x\requests.json"),
+        Path::new(r"C:\Temp\oz x\report.json"),
+        false,
+        false,
+        ShellType::PowerShell,
+    );
+    assert_eq!(
+        command,
+        r"& 'C:\Program Files\Warp\warp.exe' environment-checkout --requests-file 'C:\Temp\oz x\requests.json' --report-file 'C:\Temp\oz x\report.json' | Out-Host"
+    );
+}
+
+#[test]
+fn only_skill_source_checkouts_run_under_legacy_preparation() {
+    for shell in [
+        ShellType::Bash,
+        ShellType::Zsh,
+        ShellType::Fish,
+        ShellType::PowerShell,
+    ] {
+        for skill_sources in [false, true] {
+            let command = build_checkout_helper_command(
+                Path::new("/oz"),
+                Path::new("/requests.json"),
+                Path::new("/report.json"),
+                false,
+                skill_sources,
+                shell,
+            );
+            let command = command.strip_suffix(" | Out-Host").unwrap_or(&command);
+            assert_eq!(
+                command.ends_with(" --legacy-preparation"),
+                skill_sources,
+                "{command}"
+            );
+            assert!(!command.contains("PREPARATION"), "{command}");
+        }
     }
 }
 
@@ -1376,12 +1778,16 @@ fn blobless_clone_walks_path_limited_history_without_network() {
     assert_eq!(commit_count, 2, "expected both commits touching notes.md");
 }
 
+const FACTORY_DEFINITION_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+const FACTORY_DEFINITION_CHECKOUT: &str = "git -C \"$WARP_FACTORY_REPO_DIR\" -c advice.detachedHead=false checkout --quiet --detach 0123456789abcdef0123456789abcdef01234567";
+
 #[test]
 fn factory_clone_is_prepended_when_clone_values_are_present() {
     let mut setup_commands = vec!["make setup".to_string()];
     super::prepend_factory_definition_clone_for_values(
         "https://t:token@definitions.example.com/team/factory.git",
         "acme_factory_repo",
+        None,
         ShellType::Bash,
         &mut setup_commands,
     );
@@ -1409,6 +1815,7 @@ fn factory_clone_references_env_vars_with_the_session_shells_syntax() {
         super::prepend_factory_definition_clone_for_values(
             "https://t:token@definitions.example.com/team/factory.git",
             "acme_factory_repo",
+            None,
             shell_type,
             &mut setup_commands,
         );
@@ -1417,23 +1824,96 @@ fn factory_clone_references_env_vars_with_the_session_shells_syntax() {
 }
 
 #[test]
-fn factory_clone_is_skipped_without_clone_values() {
+fn factory_checkout_runs_after_the_clone_and_before_customer_setup() {
+    let mut setup_commands = vec!["make setup".to_string()];
+    super::prepend_factory_definition_clone_for_values(
+        "https://t:token@definitions.example.com/team/factory.git",
+        "acme_factory_repo",
+        Some(FACTORY_DEFINITION_SHA),
+        ShellType::Bash,
+        &mut setup_commands,
+    );
+    assert_eq!(
+        setup_commands,
+        vec![
+            "git clone \"$WARP_FACTORY_REPO_CLONE_URL\" \"$WARP_FACTORY_REPO_DIR\"".to_string(),
+            FACTORY_DEFINITION_CHECKOUT.to_string(),
+            "make setup".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn factory_checkout_references_the_clone_dir_with_the_session_shells_syntax() {
+    let powershell_checkout = format!(
+        "git -C \"$env:WARP_FACTORY_REPO_DIR\" -c advice.detachedHead=false checkout --quiet --detach {FACTORY_DEFINITION_SHA}"
+    );
+    for (shell_type, expected) in [
+        (ShellType::Bash, FACTORY_DEFINITION_CHECKOUT),
+        (ShellType::Zsh, FACTORY_DEFINITION_CHECKOUT),
+        (ShellType::Fish, FACTORY_DEFINITION_CHECKOUT),
+        (ShellType::PowerShell, powershell_checkout.as_str()),
+    ] {
+        let mut setup_commands = Vec::new();
+        super::prepend_factory_definition_clone_for_values(
+            "https://t:token@definitions.example.com/team/factory.git",
+            "acme_factory_repo",
+            Some(FACTORY_DEFINITION_SHA),
+            shell_type,
+            &mut setup_commands,
+        );
+        assert_eq!(setup_commands[1], expected, "{shell_type:?}");
+    }
+}
+
+#[test]
+fn factory_checkout_follows_a_persisted_environment_clone() {
+    let persisted =
+        "git clone \"$WARP_FACTORY_REPO_CLONE_URL\" \"$WARP_FACTORY_REPO_DIR\"".to_string();
+    let mut setup_commands = vec![
+        "echo before".to_string(),
+        persisted.clone(),
+        "make setup".to_string(),
+    ];
+    super::prepend_factory_definition_clone_for_values(
+        "https://t:token@definitions.example.com/team/factory.git",
+        "acme_factory_repo",
+        Some(FACTORY_DEFINITION_SHA),
+        ShellType::Bash,
+        &mut setup_commands,
+    );
+    assert_eq!(
+        setup_commands,
+        vec![
+            "echo before".to_string(),
+            persisted,
+            FACTORY_DEFINITION_CHECKOUT.to_string(),
+            "make setup".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn factory_clone_and_checkout_are_skipped_without_clone_values() {
     let mut setup_commands = vec!["make setup".to_string()];
     super::prepend_factory_definition_clone_for_values(
         "",
         "",
+        Some(FACTORY_DEFINITION_SHA),
         ShellType::Bash,
         &mut setup_commands,
     );
     super::prepend_factory_definition_clone_for_values(
         "url",
         "  ",
+        Some(FACTORY_DEFINITION_SHA),
         ShellType::Bash,
         &mut setup_commands,
     );
     super::prepend_factory_definition_clone_for_values(
         "  ",
         "dir",
+        Some(FACTORY_DEFINITION_SHA),
         ShellType::Bash,
         &mut setup_commands,
     );
@@ -1452,6 +1932,7 @@ fn factory_clone_defers_to_a_persisted_environment_copy() {
     super::prepend_factory_definition_clone_for_values(
         "https://t:token@definitions.example.com/team/factory.git",
         "acme_factory_repo",
+        None,
         ShellType::Bash,
         &mut setup_commands,
     );
@@ -1467,6 +1948,7 @@ fn factory_clone_defers_to_a_persisted_bare_clone_copy() {
     super::prepend_factory_definition_clone_for_values(
         "https://t:token@definitions.example.com/team/factory.git",
         "acme_factory_repo",
+        None,
         ShellType::Bash,
         &mut setup_commands,
     );

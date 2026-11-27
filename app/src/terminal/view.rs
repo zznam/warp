@@ -3165,7 +3165,7 @@ impl TerminalView {
             SyncInputType::RanCommand => {
                 if terminal_input_state == TerminalInputState::InputEditor {
                     self.input.update(ctx, |input, ctx| {
-                        input.run_command_in_synced_terminal_input(ctx);
+                        input.submit_current_input(ctx);
                     });
                 }
             }
@@ -13090,34 +13090,6 @@ impl TerminalView {
                             },
                             ctx
                         );
-
-                        // On dogfood only, we're interested in the block commands, durations,
-                        // and exit codes to trial Warp Analytics.
-                        if ChannelState::channel().is_dogfood() {
-                            send_telemetry_from_ctx!(
-                                TelemetryEvent::BlockCompletedOnDogfoodOnly {
-                                    block_finished_to_precmd_delay_ms: delay_ms,
-                                    honor_ps1_enabled,
-                                    num_secrets_redacted: *num_secrets_obfuscated,
-                                    num_output_lines: user_block_completed.num_output_lines,
-                                    num_output_lines_truncated: user_block_completed
-                                        .num_output_lines_truncated,
-                                    command: user_block_completed
-                                        .command
-                                        .get_with(|compute| {
-                                            let model = self.model.lock();
-                                            compute(model.block_list())
-                                        })
-                                        .to_owned(),
-                                    duration: self
-                                        .block_duration(serialized_block)
-                                        .unwrap_or_default(),
-                                    exit_code: serialized_block.exit_code,
-                                    terminal_session_id: serialized_block.session_id,
-                                },
-                                ctx
-                            );
-                        }
                     }
                 }
                 let active_session_id = self.active_block_session_id();
@@ -22601,50 +22573,6 @@ impl TerminalView {
         true
     }
 
-    /// Submits a follow-up through the run follow-up service for the REMOTE-2661 retained
-    /// setup-failure debug route. Unlike [`Self::try_submit_pending_cloud_followup`], not gated
-    /// by `HandoffCloudCloud`: the server alone decides whether it bootstraps a debug
-    /// conversation or starts a new VM.
-    ///
-    /// Returns `false` when the follow-up couldn't be routed (no bound ambient view model, or
-    /// one bound to a different task); the caller then shows an error toast.
-    fn try_submit_setup_failure_debug_followup(
-        &mut self,
-        task_id: crate::ai::ambient_agents::AmbientAgentTaskId,
-        prompt: String,
-        ctx: &mut ViewContext<Self>,
-    ) -> bool {
-        if prompt.trim().is_empty() {
-            self.input.update(ctx, |input, ctx| {
-                input.reset_after_cloud_followup_submission(ctx);
-                input.set_input_mode_agent(true, ctx);
-            });
-            self.update_pane_configuration(ctx);
-            self.focus_input_box(ctx);
-            ctx.notify();
-            return true;
-        }
-
-        let Some(ambient_agent_view_model) = self.ambient_agent_view_model.clone() else {
-            return false;
-        };
-        if ambient_agent_view_model.as_ref(ctx).task_id() != Some(task_id) {
-            return false;
-        }
-
-        ambient_agent_view_model.update(ctx, |model, ctx| {
-            model.submit_setup_failure_debug_followup(prompt, ctx);
-        });
-
-        self.input.update(ctx, |input, ctx| {
-            input.reset_after_cloud_followup_submission(ctx);
-            input.set_input_mode_agent(true, ctx);
-        });
-        self.update_pane_configuration(ctx);
-        ctx.notify();
-        true
-    }
-
     fn handle_input_event(&mut self, event: &InputEvent, ctx: &mut ViewContext<Self>) {
         match event {
             InputEvent::Enter => self.clear_prompt_suggestions(ctx),
@@ -22711,14 +22639,6 @@ impl TerminalView {
                     return;
                 }
                 self.show_error_toast("Couldn't continue this cloud task.".to_string(), ctx);
-            }
-            InputEvent::SubmitSetupFailureDebugFollowup { task_id, prompt } => {
-                if !self.try_submit_setup_failure_debug_followup(*task_id, prompt.clone(), ctx) {
-                    self.show_error_toast(
-                        "Couldn't reach the retained session to debug it.".to_string(),
-                        ctx,
-                    );
-                }
             }
             InputEvent::CancelSharedSessionConversation {
                 server_conversation_token,
@@ -24135,6 +24055,7 @@ impl TerminalView {
         };
 
         let request = RunAgentsRequest {
+            delegated_github_coauthor_user_uid: None,
             metadata: Default::default(),
             summary: summary.clone(),
             base_prompt: "Shared instructions for every child agent.".to_owned(),

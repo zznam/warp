@@ -27,6 +27,7 @@ use crate::server::server_api::ServerApi;
 use crate::server::server_api::ai::AIClient;
 use crate::server::server_api::harness_support::ResolvePromptRequest;
 use crate::terminal::CLIAgent;
+use crate::terminal::shell::ShellType;
 
 const CLAUDE_WAKE_PROMPT: &str = "A lead agent mailbox message is available for this child run. Review the mailbox context and continue the task.";
 pub(super) const CLAUDE_WAKE_PROMPT_FILE_NAME: &str = "wake-turn-prompt.txt";
@@ -97,6 +98,7 @@ impl ClaudeHarness {
             .update_agent_task(
                 task_id,
                 Some(AgentTaskState::InProgress),
+                None,
                 None,
                 None,
                 None,
@@ -238,6 +240,7 @@ impl ClaudeHarness {
             None,
             None,
             true,
+            ShellType::Bash,
         );
         let env_vars = local_wake_task_env_vars(Some(&task_id), parent_run_id.as_deref());
 

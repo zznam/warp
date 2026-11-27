@@ -531,7 +531,7 @@ fn install_model_with_call_counter(
     let counter_for_mock = counter.clone();
     let mut mock = MockAIClient::new();
     mock.expect_update_agent_task()
-        .returning(move |_, _, _, _, _, _, _| {
+        .returning(move |_, _, _, _, _, _, _, _| {
             counter_for_mock.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
@@ -560,7 +560,7 @@ fn cli_task_mapping_survives_cli_session_end() {
         let succeeded_updates_for_mock = succeeded_updates.clone();
         let mut mock = MockAIClient::new();
         mock.expect_update_agent_task()
-            .returning(move |_, task_state, _, _, _, _, _| {
+            .returning(move |_, task_state, _, _, _, _, _, _| {
                 if task_state == Some(AgentTaskState::Succeeded) {
                     succeeded_updates_for_mock.fetch_add(1, Ordering::SeqCst);
                 }
@@ -626,7 +626,7 @@ fn install_model_with_constant_result(
     let cli_sessions_model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
     let mut mock = MockAIClient::new();
     mock.expect_update_agent_task()
-        .returning(move |_, _, _, _, _, _, _| {
+        .returning(move |_, _, _, _, _, _, _, _| {
             if succeed {
                 Ok(())
             } else {
@@ -654,6 +654,42 @@ fn emit_cli_status(
             is_prompt_submit: false,
             session_context: Box::default(),
         });
+    });
+}
+
+#[test]
+fn prompt_submission_bypasses_cached_progress_without_a_cli_session() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let (model, counter) = install_model_with_call_counter(&mut app);
+        let task_id = fixed_task_id();
+        for expected_calls in 1..=3 {
+            model.update(&mut app, |model, ctx| {
+                model.on_prompt_submitted(task_id, ctx);
+            });
+            model
+                .update(&mut app, |model, _| model.wait_for_idle(task_id))
+                .with_timeout(Duration::from_secs(5))
+                .await
+                .expect("prompt progress update must finish");
+            assert_eq!(counter.load(Ordering::SeqCst), expected_calls);
+        }
+    });
+}
+
+#[test]
+fn prompt_submission_reporting_failure_does_not_block_the_caller() {
+    App::test((), |mut app| async move {
+        let (model, _) = install_model_with_constant_result(&mut app, false);
+        let task_id = fixed_task_id();
+        model.update(&mut app, |model, ctx| {
+            model.on_prompt_submitted(task_id, ctx);
+        });
+        model
+            .update(&mut app, |model, _| model.wait_for_idle(task_id))
+            .with_timeout(Duration::from_secs(5))
+            .await
+            .expect("a failed progress update must drain without blocking prompt submission");
     });
 }
 
@@ -759,6 +795,31 @@ fn wait_for_idle_resolves_after_updates_deliver_and_terminal_state_is_confirmed(
             model.confirmed_terminal_state(&task_id)
         });
         assert_eq!(confirmed, Some(AgentTaskState::Succeeded));
+        assert_eq!(
+            model.update(&mut app, |model, _| model
+                .latest_delivered_task_state(&task_id)),
+            Some(AgentTaskState::Succeeded)
+        );
+
+        emit_cli_status(
+            &cli_sessions_model,
+            &mut app,
+            terminal_view_id,
+            CLIAgentSessionStatus::InProgress,
+        );
+        model
+            .update(&mut app, |model, _| model.wait_for_idle(task_id))
+            .await;
+        assert_eq!(
+            model.update(&mut app, |model, _| model
+                .latest_delivered_task_state(&task_id)),
+            Some(AgentTaskState::InProgress)
+        );
+        assert_eq!(
+            model.update(&mut app, |model, _| model
+                .confirmed_terminal_state(&task_id)),
+            Some(AgentTaskState::Succeeded)
+        );
     });
 }
 
@@ -802,7 +863,20 @@ fn confirmed_terminal_state_remembers_blocked() {
 #[test]
 fn failed_delivery_does_not_confirm_terminal_state() {
     App::test((), |mut app| async move {
-        let (model, cli_sessions_model) = install_model_with_constant_result(&mut app, false);
+        app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let cli_sessions_model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let mut mock = MockAIClient::new();
+        mock.expect_update_agent_task()
+            .returning(|_, state, _, _, _, _, _, _| {
+                if state == Some(AgentTaskState::Succeeded) {
+                    Err(anyhow!("network error"))
+                } else {
+                    Ok(())
+                }
+            });
+        let model = app.add_singleton_model(|ctx| {
+            LocalAgentTaskSyncModel::new_with_ai_client_for_test(Arc::new(mock), ctx)
+        });
         let terminal_view_id = warpui::EntityId::new();
         let task_id = fixed_task_id();
 
@@ -825,6 +899,11 @@ fn failed_delivery_does_not_confirm_terminal_state() {
             model.confirmed_terminal_state(&task_id)
         });
         assert_eq!(confirmed, None);
+        assert_eq!(
+            model.update(&mut app, |model, _| model
+                .latest_delivered_task_state(&task_id)),
+            Some(AgentTaskState::InProgress)
+        );
     });
 }
 
@@ -887,7 +966,7 @@ fn shared_session_link_uses_correct_argument_order() {
         let mut mock = MockAIClient::new();
         mock.expect_update_agent_task()
             .withf(
-                move |arg_task_id, task_state, arg_session_id, conv_id, status_msg, _, _| {
+                move |arg_task_id, task_state, arg_session_id, _, conv_id, status_msg, _, _| {
                     *arg_task_id == task_id
                         && task_state.is_none()
                         && *arg_session_id == Some(session_id)
@@ -896,7 +975,7 @@ fn shared_session_link_uses_correct_argument_order() {
                 },
             )
             .times(1)
-            .returning(|_, _, _, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _, _, _| Ok(()));
         let ai_client: Arc<dyn AIClient> = Arc::new(mock);
         let _model = app.add_singleton_model(|ctx| {
             LocalAgentTaskSyncModel::new_with_ai_client_for_test(ai_client, ctx)
@@ -1067,7 +1146,7 @@ fn conversation_server_token_assigned_fires_update_with_conversation_id() {
         let mut mock = MockAIClient::new();
         mock.expect_update_agent_task()
             .withf(
-                move |arg_task_id, task_state, arg_session_id, conv_id, status_msg, _, _| {
+                move |arg_task_id, task_state, arg_session_id, _, conv_id, status_msg, _, _| {
                     *arg_task_id == task_id
                         && task_state.is_some()
                         && arg_session_id.is_none()
@@ -1076,7 +1155,7 @@ fn conversation_server_token_assigned_fires_update_with_conversation_id() {
                 },
             )
             .times(1)
-            .returning(|_, _, _, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _, _, _| Ok(()));
         let ai_client: Arc<dyn AIClient> = Arc::new(mock);
         let _model = app.add_singleton_model(|ctx| {
             LocalAgentTaskSyncModel::new_with_ai_client_for_test(ai_client, ctx)
@@ -1190,7 +1269,7 @@ fn preserve_terminal_setup_failure_conversation_reports_token_without_task_state
         let mut mock = MockAIClient::new();
         mock.expect_update_agent_task()
             .withf(
-                move |arg_task_id, task_state, _, conv_id, status_msg, _, _| {
+                move |arg_task_id, task_state, _, _, conv_id, status_msg, _, _| {
                     *arg_task_id == task_id
                         && task_state.is_none()
                         && conv_id.is_some()
@@ -1198,7 +1277,7 @@ fn preserve_terminal_setup_failure_conversation_reports_token_without_task_state
                 },
             )
             .times(1)
-            .returning(|_, _, _, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _, _, _| Ok(()));
         let ai_client: Arc<dyn AIClient> = Arc::new(mock);
         let _model = app.add_singleton_model(|ctx| {
             LocalAgentTaskSyncModel::new_with_ai_client_for_test(ai_client, ctx)
